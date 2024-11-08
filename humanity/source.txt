@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
+import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import { IRewards } from "../../interfaces/IRewards.sol";
+import { IVC } from "../../interfaces/IVC.sol";
+
+// Rewards is an implementation of the IRewards interface. See {IRewards} for more details
+contract Rewards is IRewards, AccessControl, Initializable {
+    // _previousCycleLastEpochID is a last contract epoch ID before the contract was stopped
+    uint256 private _previousCycleLastEpochID;
+
+    // _cycleStartTimestamp is a time when the contract was started for the last time
+    uint256 private _cycleStartTimestamp;
+
+    // _contractActive is a contract status. If not active claim is not possible
+    bool private _contractActive;
+
+    // _vcContract is a VC contract address
+    address private _vcContract;
+
+    // _tkn is a reward ERC-20 token address
+    address private _tkn;
+
+    // user address => epoch id => daily reward claimed status
+    mapping(address => mapping(uint256 => UserClaim)) private _userClaims;
+
+    // user address => genesis claimed status
+    mapping(address => bool) private _genesisClaims;
+
+    // user address => buffer amount
+    mapping(address => uint256) private _userBuffers;
+
+    function init(address vcContract, address tkn) external initializer {
+        _vcContract = vcContract;
+        _tkn = tkn;
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+    }
+
+    /**
+     * see {IRewards - currentEpoch}
+     */
+    function currentEpoch() external view returns (uint256) {
+        return _currentEpoch();
+    }
+
+    /**
+     * see {IRewards - cycleStartTimestamp}
+     */
+    function cycleStartTimestamp() external view returns (uint256) {
+        return _cycleStartTimestamp;
+    }
+
+    /**
+     * see {IRewards - start}
+     */
+    function start(uint256 startTimestamp) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(!_contractActive, "Rewards: contract already active");
+        require(
+            startTimestamp <= block.timestamp,
+            "Rewards: start timestamp should be less or equal to current timestamp"
+        );
+
+        _cycleStartTimestamp = startTimestamp;
+        _contractActive = true;
+    }
+
+    /**
+     * see {IRewards - stop}
+     */
+    function stop() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_contractActive, "Rewards: contract not active");
+
+        _previousCycleLastEpochID = _currentEpoch();
+        _contractActive = false;
+    }
+
+    /**
+     * see {IRewards - userBuffer}
+     */
+    function userBuffer(address user) external view returns (uint256) {
+        return _userBuffers[user];
+    }
+
+    /**
+     * see {IRewards - userClaimStatus}
+     */
+    function userClaimStatus(address user, uint256 epochID) external view returns (UserClaim memory) {
+        return _userClaims[user][epochID];
+    }
+
+    /**
+     * see {IRewards - userGenesisClaimStatus}
+     */
+    function userGenesisClaimStatus(address user) external view returns (bool) {
+        return _genesisClaims[user];
+    }
+
+    /**
+     * see {IRewards - claimBuffer}
+     */
+    function claimBuffer() external {
+        require(_contractActive, "Rewards: contract not active");
+        require(IVC(_vcContract).isRegistered(msg.sender), "Rewards: user not registered");
+        uint256 amount = _userBuffers[msg.sender];
+        require(amount > 0, "Rewards: buffer empty");
+
+        IERC20(_tkn).transfer(msg.sender, amount);
+        _userBuffers[msg.sender] = 0;
+
+        emit RewardClaimed(msg.sender, RewardType.REFERRAL, amount);
+    }
+
+    /**
+     * see {IRewards - claimReward}
+     */
+    function claimReward() external {
+        require(_contractActive, "Rewards: contract not active");
+        require(IVC(_vcContract).isRegistered(msg.sender), "Rewards: user not registered");
+
+        uint256 amount;
+        if (!_genesisClaims[msg.sender]) {
+            amount = _calculateGenesisReward();
+
+            IERC20(_tkn).transfer(msg.sender, amount);
+            _increaseBuffer(amount, IVC(_vcContract).getReferrersTree(msg.sender));
+            _genesisClaims[msg.sender] = true;
+
+            _userClaims[msg.sender][_currentEpoch()].claimStatus = true;
+            _userBuffers[msg.sender] += _userClaims[msg.sender][_currentEpoch()].buffer;
+            _userClaims[msg.sender][_currentEpoch()].buffer = 0;
+
+            emit RewardClaimed(msg.sender, RewardType.GENESIS, amount);
+            return;
+        }
+
+        if (!_userClaims[msg.sender][_currentEpoch()].claimStatus) {
+            amount = _calculateDailyReward();
+
+            IERC20(_tkn).transfer(msg.sender, amount);
+            _increaseBuffer(amount, IVC(_vcContract).getReferrersTree(msg.sender));
+
+            _userClaims[msg.sender][_currentEpoch()].claimStatus = true;
+            _userBuffers[msg.sender] += _userClaims[msg.sender][_currentEpoch()].buffer;
+            _userClaims[msg.sender][_currentEpoch()].buffer = 0;
+
+            emit RewardClaimed(msg.sender, RewardType.DAILY, amount);
+            return;
+        }
+
+        revert("Rewards: no rewards available");
+    }
+
+    /**
+     * @dev will increase user referrers buffer if referer claimed reward on the past epoch (current epoch - 1).
+     * Each next referer in the referrers array will receive haf of the previous referer amount.
+     */
+    function _increaseBuffer(uint256 initialAmount, address[] memory referrers) internal {
+        if (referrers.length > 0) {
+            uint256 buffer = initialAmount;
+            for (uint256 i = 0; i < referrers.length; i++) {
+                buffer = buffer / 2;
+
+                bool bufferSafe = false;
+                if (_userClaims[referrers[i]][_currentEpoch()].claimStatus) {
+                    _userBuffers[referrers[i]] += buffer;
+                    bufferSafe = true;
+                } else {
+                    _userClaims[referrers[i]][_currentEpoch()].buffer += buffer;
+                }
+
+                emit ReferralRewardBuffered(msg.sender, referrers[i], buffer, bufferSafe);
+            }
+        }
+    }
+
+    /**
+     * @dev if contract is active will return current epoch ID (number of fill days between current time and
+     * _cycleStartTimestamp + 1 + _previousCycleLastEpochID). If not will return _previousCycleLastEpochID.
+     */
+    function _currentEpoch() internal view returns (uint256) {
+        if (_contractActive) {
+            return ((block.timestamp - _cycleStartTimestamp) / (1 days)) + 1 + _previousCycleLastEpochID;
+        } else {
+            return _previousCycleLastEpochID;
+        }
+    }
+
+    /**
+     * @dev calculation daily reward logic based on usersCount from VC contract. Will return reward in wei
+     */
+    function _calculateDailyReward() internal view returns (uint256 reward) {
+        uint256 usersCount = IVC(_vcContract).totalUsers();
+
+        // 0 => 500 000 --> 100
+        if (usersCount <= 500000) {
+            reward = 100;
+            // 500 001 => 1 000 000 --> 75
+        } else if (500000 < usersCount && usersCount <= 1000000) {
+            reward = 75;
+            // 1 000 001 => 5 000 000 --> 50
+        } else if (1000000 < usersCount && usersCount <= 5000000) {
+            reward = 50;
+            // 5 000 001 => 10 000 000 --> 25
+        } else if (5000000 < usersCount && usersCount <= 10000000) {
+            reward = 25;
+            // 10 000 001 => 50 000 000 --> 10
+        } else if (10000001 < usersCount && usersCount <= 50000000) {
+            reward = 10;
+            // 50 000 001 => 100 000 000 --> 5
+        } else if (50000000 < usersCount && usersCount <= 100000000) {
+            reward = 5;
+            // 100 000 001 => 500 000 000 --> 2
+        } else if (100000001 < usersCount && usersCount <= 500000000) {
+            reward = 2;
+            // 500 000 001 => --> 1
+        } else if (usersCount > 500000001) {
+            reward = 1;
+        }
+
+        return reward * 1 ether;
+    }
+
+    /**
+     * @dev calculation genesis reward logic based on usersCount from VC contract. Will return reward in wei
+     */
+    function _calculateGenesisReward() internal view returns (uint256 reward) {
+        uint256 usersCount = IVC(_vcContract).getUsersCountOnRegistration(msg.sender);
+
+        // 0 => 10 000 --> 10 000
+        if (usersCount <= 10000) {
+            reward = 10000;
+            // 10 001 => 100 000 --> 1 000
+        } else if (10000 < usersCount && usersCount <= 100000) {
+            reward = 1000;
+            // 100 001 => 1 000 000 --> 250
+        } else if (100000 < usersCount && usersCount <= 1000000) {
+            reward = 250;
+            // 1 000 001 => 10 000 000 --> 120
+        } else if (1000000 < usersCount && usersCount <= 10000000) {
+            reward = 120;
+            // 10 000 001 => 100 000 000 --> 60
+        } else if (10000000 < usersCount && usersCount <= 100000000) {
+            reward = 60;
+            // 100 000 001 => 1 000 000 000 --> 30
+        } else if (100000000 < usersCount && usersCount <= 1000000000) {
+            reward = 30;
+            // 1 000 000 000 => --> 10
+        } else if (usersCount > 1000000000) {
+            reward = 10;
+        }
+
+        return reward * 1 ether;
+    }
+}

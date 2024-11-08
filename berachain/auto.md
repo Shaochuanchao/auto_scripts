@@ -1,0 +1,12 @@
+#berachain自动交互脚本
+整合脚本执行
+1、私钥配置通过文件传入
+2、执行bera_swap.py中的swap_bera_to_stgusdc方法，将bera换成stgusdc，金额0.5-0.8随机
+3、随即等待5-10秒
+4、执行bera_mint_honey.py中的mint_honey方法，将全部stgusdc换成bhoney
+5、随即等待5-10秒
+6、执行bera_bend_supply.py中的supply_honey方法，数量不传
+7、随机等待5-10秒
+8、执行bera_berps_deposit.py的deposit_honey方法，数量不传
+9、随机等待1-5秒
+10、执行bera_berps_stake.py的stake_bhoney方法，数量不传
